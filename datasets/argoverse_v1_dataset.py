@@ -97,9 +97,9 @@ def process_argoverse(split: str,
     timestamps = list(np.sort(df['TIMESTAMP'].unique()))
     historical_timestamps = timestamps[: 20]
     historical_df = df[df['TIMESTAMP'].isin(historical_timestamps)]
-    actor_ids = list(historical_df['TRACK_ID'].unique())
-    df = df[df['TRACK_ID'].isin(actor_ids)]
-    num_nodes = len(actor_ids)
+    actor_ids = list(historical_df['TRACK_ID'].unique()) #历史帧数中所有参与的车辆id
+    df = df[df['TRACK_ID'].isin(actor_ids)] #排除掉在历史帧数中未出现的车辆
+    num_nodes = len(actor_ids) #参与车辆数，即节点数
 
     av_df = df[df['OBJECT_TYPE'] == 'AV'].iloc
     av_index = actor_ids.index(av_df[0]['TRACK_ID'])
@@ -108,9 +108,9 @@ def process_argoverse(split: str,
     city = df['CITY_NAME'].values[0]
 
     # make the scene centered at AV
-    origin = torch.tensor([av_df[19]['X'], av_df[19]['Y']], dtype=torch.float)
-    av_heading_vector = origin - torch.tensor([av_df[18]['X'], av_df[18]['Y']], dtype=torch.float)
-    theta = torch.atan2(av_heading_vector[1], av_heading_vector[0])
+    origin = torch.tensor([av_df[19]['X'], av_df[19]['Y']], dtype=torch.float) #19是20个历史帧中的最后一帧，即当前帧自车的位置作为origin
+    av_heading_vector = origin - torch.tensor([av_df[18]['X'], av_df[18]['Y']], dtype=torch.float) #计算自车heading的向量
+    theta = torch.atan2(av_heading_vector[1], av_heading_vector[0]) #自车航向角
     rotate_mat = torch.tensor([[torch.cos(theta), -torch.sin(theta)],
                                [torch.sin(theta), torch.cos(theta)]])
 
@@ -125,28 +125,31 @@ def process_argoverse(split: str,
         node_idx = actor_ids.index(actor_id)
         node_steps = [timestamps.index(timestamp) for timestamp in actor_df['TIMESTAMP']]
         padding_mask[node_idx, node_steps] = False
-        if padding_mask[node_idx, 19]:  # make no predictions for actors that are unseen at the current time step
+        if padding_mask[node_idx, 19]:  # make no predictions for actors that are unseen at the current time step “对于当前时间步未被观察到的actor，不进行任何预测。”
             padding_mask[node_idx, 20:] = True
         xy = torch.from_numpy(np.stack([actor_df['X'].values, actor_df['Y'].values], axis=-1)).float()
-        x[node_idx, node_steps] = torch.matmul(xy - origin, rotate_mat)
+        x[node_idx, node_steps] = torch.matmul(xy - origin, rotate_mat) #计算相对坐标旋转之后的坐标:一条横线
         node_historical_steps = list(filter(lambda node_step: node_step < 20, node_steps))
-        if len(node_historical_steps) > 1:  # calculate the heading of the actor (approximately)
+        if len(node_historical_steps) > 1:  # calculate the heading of the actor (approximately) 未传出结果
             heading_vector = x[node_idx, node_historical_steps[-1]] - x[node_idx, node_historical_steps[-2]]
             rotate_angles[node_idx] = torch.atan2(heading_vector[1], heading_vector[0])
-        else:  # make no predictions for the actor if the number of valid time steps is less than 2
+        else:  # make no predictions for the actor if the number of valid time steps is less than 2 “如果有效时间步的数量少于 2，则不对该actor进行任何预测。”
             padding_mask[node_idx, 20:] = True
 
-    # bos_mask is True if time step t is valid and time step t-1 is invalid
+    # bos_mask is True if time step t is valid and time step t-1 is invalid “如果时间步 t 有效，但时间步 t-1 无效，则将 BOS 标记设置为 True。”
     bos_mask[:, 0] = ~padding_mask[:, 0]
     bos_mask[:, 1: 20] = padding_mask[:, : 19] & ~padding_mask[:, 1: 20]
 
     positions = x.clone()
-    x[:, 20:] = torch.where((padding_mask[:, 19].unsqueeze(-1) | padding_mask[:, 20:]).unsqueeze(-1),
-                            torch.zeros(num_nodes, 30, 2),
-                            x[:, 20:] - x[:, 19].unsqueeze(-2))
+
+    # 将 x 的后半部分和第 1 列到第 19 列根据相应的掩码条件进行调整，如果掩码指示为填充位置，则替换为零，否则进行计算。
+    # 将 x 的第 0 列填充为零。
+    x[:, 20:] = torch.where((padding_mask[:, 19].unsqueeze(-1) | padding_mask[:, 20:]).unsqueeze(-1), #如果掩码指示为填充位置，则替换为零，否则进行计算。
+                            torch.zeros(num_nodes, 30, 2), #填充为零。
+                            x[:, 20:] - x[:, 19].unsqueeze(-2)) #计算每个agent的后30个时间步的相对位置，即相对于19帧的位置。
     x[:, 1: 20] = torch.where((padding_mask[:, : 19] | padding_mask[:, 1: 20]).unsqueeze(-1),
                               torch.zeros(num_nodes, 19, 2),
-                              x[:, 1: 20] - x[:, : 19])
+                              x[:, 1: 20] - x[:, : 19])#计算每个agent的前19个时间步的相对位置，即每个时间步相对于上个时间步的位置。
     x[:, 0] = torch.zeros(num_nodes, 2)
 
     # get lane features at the current time step
@@ -193,17 +196,17 @@ def get_lane_features(am: ArgoverseMap,
                                               torch.Tensor]:
     lane_positions, lane_vectors, is_intersections, turn_directions, traffic_controls = [], [], [], [], []
     lane_ids = set()
-    for node_position in node_positions:
+    for node_position in node_positions: #对每个agent当前帧的绝对位置进行遍历，获取该位置附近的所有道路
         lane_ids.update(am.get_lane_ids_in_xy_bbox(node_position[0], node_position[1], city, radius))
-    node_positions = torch.matmul(node_positions - origin, rotate_mat).float()
+    node_positions = torch.matmul(node_positions - origin, rotate_mat).float() #将当前帧的绝对位置转换成相对于自车坐标的相对位置，并进行旋转
     for lane_id in lane_ids:
         lane_centerline = torch.from_numpy(am.get_lane_segment_centerline(lane_id, city)[:, : 2]).float()
-        lane_centerline = torch.matmul(lane_centerline - origin, rotate_mat)
+        lane_centerline = torch.matmul(lane_centerline - origin, rotate_mat) #将道路的绝对位置转换成相对于自车坐标的相对位置，并进行旋转
         is_intersection = am.lane_is_in_intersection(lane_id, city)
         turn_direction = am.get_lane_turn_direction(lane_id, city)
         traffic_control = am.lane_has_traffic_control_measure(lane_id, city)
-        lane_positions.append(lane_centerline[:-1])
-        lane_vectors.append(lane_centerline[1:] - lane_centerline[:-1])
+        lane_positions.append(lane_centerline[:-1]) #只保留道路centerline的n-1个点，去除最后一个点
+        lane_vectors.append(lane_centerline[1:] - lane_centerline[:-1]) #计算道路centerline的n-1个点的向量，即每个点到下一个点的向量
         count = len(lane_centerline) - 1
         is_intersections.append(is_intersection * torch.ones(count, dtype=torch.uint8))
         if turn_direction == 'NONE':
@@ -216,17 +219,17 @@ def get_lane_features(am: ArgoverseMap,
             raise ValueError('turn direction is not valid')
         turn_directions.append(turn_direction * torch.ones(count, dtype=torch.uint8))
         traffic_controls.append(traffic_control * torch.ones(count, dtype=torch.uint8))
-    lane_positions = torch.cat(lane_positions, dim=0)
+    lane_positions = torch.cat(lane_positions, dim=0) #按行拼接
     lane_vectors = torch.cat(lane_vectors, dim=0)
     is_intersections = torch.cat(is_intersections, dim=0)
     turn_directions = torch.cat(turn_directions, dim=0)
     traffic_controls = torch.cat(traffic_controls, dim=0)
 
-    lane_actor_index = torch.LongTensor(list(product(torch.arange(lane_vectors.size(0)), node_inds))).t().contiguous()
+    lane_actor_index = torch.LongTensor(list(product(torch.arange(lane_vectors.size(0)), node_inds))).t().contiguous() # 生成一个包含所有agent和道路的索引对 (2,node_inds*lane_vector_size)
     lane_actor_vectors = \
-        lane_positions.repeat_interleave(len(node_inds), dim=0) - node_positions.repeat(lane_vectors.size(0), 1)
-    mask = torch.norm(lane_actor_vectors, p=2, dim=-1) < radius
-    lane_actor_index = lane_actor_index[:, mask]
+        lane_positions.repeat_interleave(len(node_inds), dim=0) - node_positions.repeat(lane_vectors.size(0), 1) #计算车道坐标相对于每个agent的相对位置
+    mask = torch.norm(lane_actor_vectors, p=2, dim=-1) < radius #计算每个agent和道路的距离，并判断是否小于半径
+    lane_actor_index = lane_actor_index[:, mask] #掩码筛选 lane_actor_index 中的agent和lane的索引对，仅保留与道路距离小于半径的对应行
     lane_actor_vectors = lane_actor_vectors[mask]
 
     return lane_vectors, is_intersections, turn_directions, traffic_controls, lane_actor_index, lane_actor_vectors
